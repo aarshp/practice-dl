@@ -59,6 +59,37 @@ class ResnetBlock(nn.Module):
 
         return output
     
+class LeNet5(nn.Module):
+    def __init__(self, inChannel, nClasses):
+        super(LeNet5, self).__init__()
+    
+        self.convSequential = nn.Sequential(
+            nn.Conv2d(inChannel, 6, (5,5), stride=1),
+            nn.GroupNorm(1,6),
+            nn.ReLU(),
+            nn.MaxPool2d((2,2), stride=2),
+            nn.Conv2d(6, 16, (5,5), stride=1),
+            nn.GroupNorm(1, 16),
+            nn.ReLU(),
+            nn.AvgPool2d((2,2), stride=2),
+            nn.SiLUß()
+        )
+        self.fcSeq = nn.Sequential(
+            nn.Linear(400, 120),
+            nn.ReLU(),
+            nn.Linear(120, 84),
+            nn.ReLU(),
+            nn.Linear(84, nClasses),
+        )
+
+    def forward(self, xt, scaledTimeStep ):
+        timeStepTensor = scaledTimeStep.view(-1, 1, 1, 1)
+        timeStepTensor = timeStepTensor.expand(-1, 1, xt.shape[2], xt.shape[3])
+        out = torch.cat((xt, timeStepTensor), dim=1)
+        out = self.convSequential(out)
+        out = out.reshape(out.size(0), -1)
+        out = self.fcSeq(out)
+        return out
 
 class DenoiserUnet(nn.Module):
     def __init__(self, postionalEncodingSize = 128, inputChannel = 1, startingChannel = 8, stages =3) :
@@ -174,6 +205,45 @@ def loadMNISTDataset(device, train=True):
 
     return mnistDataset
 
+def trainClassifier(dataset, scheduler, classifier, device, optimizer = None, epochs = 100):
+
+    dataloader = DataLoader (dataset, shuffle=True, batch_size=128)
+    lossFn = nn.CrossEntropyLoss()
+    if optimizer ==  None: 
+        optimizer = torch.optim.Adam(classifier.parameters(), lr=1e-3)
+    noiseLevelMap = {
+        0:300,
+        1:300,
+        2:600,
+        3:600
+    }
+    for epoch in range(epochs):
+        epochLoss = 0.0
+        for i, (x, label) in enumerate(dataloader):
+            batchSize = x.shape[0]
+            x = x.to(device)
+            label = label.to(device)
+            noiseLevel = scheduler.T if epoch not in noiseLevelMap else noiseLevelMap[epoch]
+            t = torch.randint(0, noiseLevel, (batchSize,), dtype=torch.long, device=device)
+            noise = torch.randn_like(x)
+            xt = scheduler.samplet(x, t, noise) 
+            predictedLogits = classifier(xt, t.float()/scheduler.T)
+            loss = lossFn(predictedLogits, label)
+            epochLoss += loss.item()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            if i%100 == 0:
+                print(f"Epoch {epoch} | Batch {i} | Loss: {loss.item():.4f}") 
+        
+        epochLoss = epochLoss / len(dataloader)
+        print(f"--- Epoch {epoch} Average Loss: {epochLoss:.4f} ---")
+
+        if epoch % 10 == 0:
+            torch.save(classifier.state_dict(), f'classifier_model_{epoch}.pth')
+            print(f"Model saved at epoch {epoch} with new best loss: {epochLoss:.4f}")
+
+
 def train(device, dataset, denoiser, scheduler, optimizer=None, epochs = 20):
     dataloader = DataLoader(dataset, shuffle=True, batch_size=64)
     lossFn = nn.MSELoss()
@@ -246,6 +316,8 @@ def main():
     # train(device, mnistDataset, denoiser, scheduler)
 
     # images = generateImages(denoiser, scheduler, "./denoiser_model_16.pth", device, nSteps=1000, nSamples=25)
+    classifier = LeNet5(inChannel=2, nClasses=10).to(device)
+    trainClassifier(mnistDataset, scheduler, classifier, device)
 
 if __name__ == '__main__':
     main()
