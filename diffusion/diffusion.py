@@ -4,6 +4,7 @@ from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from torch import nn
+import torch.nn.functional as F
 import math
 import pickle
 import os
@@ -72,7 +73,7 @@ class LeNet5(nn.Module):
             nn.GroupNorm(1, 16),
             nn.ReLU(),
             nn.AvgPool2d((2,2), stride=2),
-            nn.SiLUß()
+            nn.SiLU()
         )
         self.fcSeq = nn.Sequential(
             nn.Linear(400, 120),
@@ -164,7 +165,7 @@ def visualizeMNIST(dataset):
     plt.tight_layout()
     plt.show()
 
-def visualizeImages(images):
+def visualizeImages(images, sampleClasses=None):
     images = images.to('cpu')
     gridSize = (int)(math.sqrt((images.shape[0])))
 
@@ -174,7 +175,10 @@ def visualizeImages(images):
         image = images[i]
         ax = axes[i // gridSize, i % gridSize]
         ax.imshow(image.squeeze(), cmap='gray')
-        ax.set_title("hehe", fontsize=10)
+        if sampleClasses is None:
+            ax.set_title("hehe", fontsize=10)
+        else:
+            ax.set_title(sampleClasses[i].item(),  fontsize=10)
         ax.axis('off')
     plt.tight_layout()
     plt.show()
@@ -205,19 +209,21 @@ def loadMNISTDataset(device, train=True):
 
     return mnistDataset
 
-def trainClassifier(dataset, scheduler, classifier, device, optimizer = None, epochs = 100):
+def trainClassifier(dataset, scheduler, classifier, device, optimizer = None, epochs = 5):
 
     dataloader = DataLoader (dataset, shuffle=True, batch_size=128)
     lossFn = nn.CrossEntropyLoss()
     if optimizer ==  None: 
         optimizer = torch.optim.Adam(classifier.parameters(), lr=1e-3)
     noiseLevelMap = {
-        0:300,
-        1:300,
-        2:600,
-        3:600
+        0:int(scheduler.T*0.3),
+        1:int(scheduler.T*0.3),
+        2:int(scheduler.T*0.6),
+        3:int(scheduler.T*0.6),
+        4:int(scheduler.T*0.8),
+        5:int(scheduler.T)
     }
-    for epoch in range(epochs):
+    for epoch in range(max(epochs, len(noiseLevelMap))):
         epochLoss = 0.0
         for i, (x, label) in enumerate(dataloader):
             batchSize = x.shape[0]
@@ -239,9 +245,8 @@ def trainClassifier(dataset, scheduler, classifier, device, optimizer = None, ep
         epochLoss = epochLoss / len(dataloader)
         print(f"--- Epoch {epoch} Average Loss: {epochLoss:.4f} ---")
 
-        if epoch % 10 == 0:
-            torch.save(classifier.state_dict(), f'classifier_model_{epoch}.pth')
-            print(f"Model saved at epoch {epoch} with new best loss: {epochLoss:.4f}")
+        torch.save(classifier.state_dict(), f'classifier_model_{epoch}.pth')
+        print(f"Model saved at epoch {epoch} with new best loss: {epochLoss:.4f}")
 
 
 def train(device, dataset, denoiser, scheduler, optimizer=None, epochs = 20):
@@ -277,31 +282,53 @@ def train(device, dataset, denoiser, scheduler, optimizer=None, epochs = 20):
             print(f"Model saved at epoch {epoch} with new best loss: {epochLoss:.4f}")
 
 
-def generateImages(denoiser, scheduler, modelPath, device, nSteps = 5, nSamples=5, imageSize =(1,32,32)):
-    
-    denoiser.load_state_dict(torch.load(modelPath, device))
-    denoiser.eval()
+def generateImages(denoiser, scheduler, device, nSteps = 10000, nSamples=5, imageSize =(1,32,32), classifier = None, guidanceFactor = 7):
+    denoiserModel, denoiserParamsPath = denoiser
+    denoiserModel.load_state_dict(torch.load(denoiserParamsPath, device))
+    denoiserModel.eval()
+    generateImagesWithClassifierGuidance = classifier != None
+    if generateImagesWithClassifierGuidance:
+        classifierModel, classifierParamPath = classifier
+        classifierModel.load_state_dict(torch.load(classifierParamPath, device))
+        sampleClasses = torch.randint(0, 10, (nSamples, ), dtype=int, device=device)
+        classifierModel.eval()
+        
     collectedXs= []
-    with torch.no_grad():
-        x  = torch.randn(nSamples, *imageSize, device=device)
-        for step in range(nSteps - 1, -1, -1):
-            
-            t = torch.full((nSamples,), step, dtype=int, device=device)
-            predictedNoise = denoiser(x, t)
-            alphat = scheduler.alpha[t].view(-1, *([1]*(len(imageSize))))
-            alphaBart = scheduler.alphaBar[t].view(-1, *([1]*(len(imageSize))))
-            betat = scheduler.beta[t].view(-1, *([1]*(len(imageSize))))
+    x  = torch.randn(nSamples, *imageSize, device=device)
+    
+    for step in range(nSteps - 1, -1, -1):
+        
+        t = torch.full((nSamples,), step, dtype=int, device=device)
+        with torch.no_grad():
+            predictedNoise = denoiserModel(x, t)
+        if generateImagesWithClassifierGuidance:
+            xIn = x.detach().requires_grad_(True)
+            logp = F.log_softmax(classifierModel(xIn, t.float()/scheduler.T), dim=-1)
+            classifierLoss = logp[torch.arange(xIn.shape[0]), sampleClasses].sum()
+            grad = torch.autograd.grad(classifierLoss, xIn)[0]
+            x.requires_grad = False
+        else:
+            grad = torch.zeros_like(x)
+
+        alphat = scheduler.alpha[t].view(-1, *([1]*(len(imageSize))))
+        alphaBart = scheduler.alphaBar[t].view(-1, *([1]*(len(imageSize))))
+        betat = scheduler.beta[t].view(-1, *([1]*(len(imageSize))))
+        if step > 0:
             alphaBartMinusOne = scheduler.alphaBar[t-1].view(-1, *([1]*(len(imageSize))))
-            muAtT = (1/torch.sqrt(alphat))*(x - (betat/torch.sqrt(1-alphaBart))*predictedNoise)
-            sigmaAtT = betat*(1-alphaBartMinusOne)/(1-alphaBart)
-            if step == 0:
-                x = muAtT
-            else:
-                x = muAtT + torch.sqrt(sigmaAtT)*torch.randn_like(x)
-            collectedXs.append(x)
+        else:
+            alphaBartMinusOne = torch.ones_like(alphaBart)
+        sigmaAtT = betat*(1-alphaBartMinusOne)/(1-alphaBart)
+
+        guidedPredictedNoise = predictedNoise - guidanceFactor*grad*sigmaAtT            
+        muAtT = (1/torch.sqrt(alphat))*(x - (betat/torch.sqrt(1-alphaBart))*guidedPredictedNoise)
+        if step == 0:
+            x = muAtT
+        else:
+            x = muAtT + torch.sqrt(sigmaAtT)*torch.randn_like(x)
+        collectedXs.append(x)
 
     
-    visualizeImages(x)
+    visualizeImages(x, sampleClasses)
     collectedXs = torch.stack(collectedXs)
     firstImageSteps = collectedXs[::40, 0, :, :, :]
     visualizeImages(firstImageSteps)
@@ -315,9 +342,11 @@ def main():
     denoiser = DenoiserUnet().to(device)
     # train(device, mnistDataset, denoiser, scheduler)
 
-    # images = generateImages(denoiser, scheduler, "./denoiser_model_16.pth", device, nSteps=1000, nSamples=25)
+    
     classifier = LeNet5(inChannel=2, nClasses=10).to(device)
-    trainClassifier(mnistDataset, scheduler, classifier, device)
+    # trainClassifier(mnistDataset, scheduler, classifier, device)
+
+    images = generateImages((denoiser,"./denoiser_model_16.pth"), scheduler,  device, nSteps=1000, nSamples=25, classifier=(classifier, "./classifier_model_5.pth"))
 
 if __name__ == '__main__':
     main()
