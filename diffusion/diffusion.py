@@ -93,32 +93,36 @@ class LeNet5(nn.Module):
         return out
 
 class DenoiserUnet(nn.Module):
-    def __init__(self, postionalEncodingSize = 128, inputChannel = 1, startingChannel = 8, stages =3) :
+    def __init__(self, timeEncodingSize = 128, inputChannel = 1, startingChannel = 8, stages = 3, noOfClasses = None) :
         super().__init__()
-        self.postionalEncodingSize = postionalEncodingSize
+        self.postionalEncodingSize = timeEncodingSize
         self.startingChannel = startingChannel
         self.stemConv = nn.Conv2d(inputChannel, startingChannel, (3,3), 1, 1)
+        self.addClassCondition = False
+        if noOfClasses != None:
+            self.addClassCondition = True
+            self.classEmbeddingLayer = nn.Embedding(noOfClasses + 1, timeEncodingSize)
         self.downsamplingBlocks = nn.ModuleList()
         for stage in range(stages):
             channelSize = (int)(startingChannel*(2**(stage)))
-            self.downsamplingBlocks.append(ResnetBlock(channelSize, channelSize, postionalEncodingSize))
-            self.downsamplingBlocks.append(ResnetBlock(channelSize, channelSize, postionalEncodingSize))
+            self.downsamplingBlocks.append(ResnetBlock(channelSize, channelSize, timeEncodingSize))
+            self.downsamplingBlocks.append(ResnetBlock(channelSize, channelSize, timeEncodingSize))
             self.downsamplingBlocks.append(nn.Conv2d(channelSize, channelSize*2, (3,3), stride=2, padding=1))
 
         channelSize = (int)(startingChannel*(2**(stages)))
   
-        self.bottleneck = nn.ModuleList([ResnetBlock(channelSize, channelSize, postionalEncodingSize), 
-                                         ResnetBlock(channelSize, channelSize, postionalEncodingSize)])
+        self.bottleneck = nn.ModuleList([ResnetBlock(channelSize, channelSize, timeEncodingSize), 
+                                         ResnetBlock(channelSize, channelSize, timeEncodingSize)])
         self.upsamplingBlocks = nn.ModuleList()
         for stage in range(stages):
             channelSize = (int)(startingChannel*(2**(stages-stage)))
             self.upsamplingBlocks.append(nn.ConvTranspose2d(channelSize, channelSize//2, (3,3), stride=2, padding=1, output_padding=1))
-            self.upsamplingBlocks.append(ResnetBlock(channelSize, channelSize//2, postionalEncodingSize))
-            self.upsamplingBlocks.append(ResnetBlock(channelSize//2, channelSize//2, postionalEncodingSize))
+            self.upsamplingBlocks.append(ResnetBlock(channelSize, channelSize//2, timeEncodingSize))
+            self.upsamplingBlocks.append(ResnetBlock(channelSize//2, channelSize//2, timeEncodingSize))
         
         self.stemUpsampleConv = nn.Conv2d(startingChannel, inputChannel, (3,3), 1, 1)
 
-    def forward(self, xt, t):
+    def forward(self, xt, t, y = None):
         device = xt.device
         tTensor = torch.as_tensor(t, dtype=torch.float32, device=device).unsqueeze(-1)  
         divTerm = torch.exp(
@@ -127,28 +131,31 @@ class DenoiserUnet(nn.Module):
         )
 
         angles = tTensor * divTerm 
-
-        positionalEncoding = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)  
-
+        timeEncoding = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
+        if self.addClassCondition:
+            classEncoding = self.classEmbeddingLayer(y)
+            finalEncoding = timeEncoding + classEncoding
+        else:
+            finalEncoding = timeEncoding  
         output = self.stemConv(xt)
         skipOutputs = []
         for idx,layer in enumerate(self.downsamplingBlocks):
             if idx%3 == 2:
                 output = layer(output) #downsample conv
             else:
-                output = layer(output, positionalEncoding) #resnet blocks
+                output = layer(output, finalEncoding) #resnet blocks
             if idx%3 == 1:
                 skipOutputs.append(output) #output of second resnet
         
         for layer in self.bottleneck:
-            output = layer(output, positionalEncoding)
+            output = layer(output, finalEncoding)
         
         for idx,layer in enumerate(self.upsamplingBlocks):
             if idx %3 ==0:
                 output = layer(output)
                 output = torch.cat((output, skipOutputs.pop()), dim=1)
             else:
-                output = layer(output, positionalEncoding)
+                output = layer(output, finalEncoding)
 
         output = self.stemUpsampleConv(output)
         return output
@@ -183,6 +190,24 @@ def visualizeImages(images, sampleClasses=None):
     plt.tight_layout()
     plt.show()
 
+def loadCifarDataset(device, train = True):
+    if train:
+        pickle_path = 'cifar_dataset_32x32.pkl'
+    else:
+        pickle_path = 'cifar_dataset_test_32x32.pkl'
+
+    if os.path.exists(pickle_path):
+        print(f"Loading dataset from {pickle_path}...")
+        with open(pickle_path, 'rb') as f:
+            cifarDataset = pickle.load(f)
+    else:
+        print("Downloading and preparing Cifar Dataset...")
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5), (0.5))
+        ])
+        cifarDataset  = datasets.CIFAR10('.', download=True, transform=transform, train=train)
+    return cifarDataset
 
 def loadMNISTDataset(device, train=True):
     if train:
@@ -249,7 +274,7 @@ def trainClassifier(dataset, scheduler, classifier, device, optimizer = None, ep
         print(f"Model saved at epoch {epoch} with new best loss: {epochLoss:.4f}")
 
 
-def train(device, dataset, denoiser, scheduler, optimizer=None, epochs = 20):
+def trainDenoiser(device, dataset, denoiser, scheduler, optimizer=None, epochs = 20):
     dataloader = DataLoader(dataset, shuffle=True, batch_size=64)
     lossFn = nn.MSELoss()
     if optimizer ==  None: 
@@ -259,7 +284,7 @@ def train(device, dataset, denoiser, scheduler, optimizer=None, epochs = 20):
 
     for epoch in range(epochs):
         epochLoss = 0.0
-        for i, (x, _) in enumerate(dataloader):
+        for i, (x, y) in enumerate(dataloader):
             batchSize = x.shape[0]
             x = x.to(device)
             t = torch.randint(0, scheduler.T, (batchSize,), dtype=int, device=device)
@@ -337,16 +362,20 @@ def generateImages(denoiser, scheduler, device, nSteps = 10000, nSamples=5, imag
 
 def main():
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    mnistDataset = loadMNISTDataset(device)
+    # mnistDataset = loadMNISTDataset(device)
     scheduler = Scheduler(start=1e-4, end=0.02, T=1000, device=device) 
-    denoiser = DenoiserUnet().to(device)
-    # train(device, mnistDataset, denoiser, scheduler)
-
-    
+    # denoiser = DenoiserUnet().to(device)
+    # trainDenoiser(device, mnistDataset, denoiser, scheduler)    
     classifier = LeNet5(inChannel=2, nClasses=10).to(device)
     # trainClassifier(mnistDataset, scheduler, classifier, device)
+    cifarDataset = loadCifarDataset(device=device)
 
-    images = generateImages((denoiser,"./denoiser_model_16.pth"), scheduler,  device, nSteps=1000, nSamples=25, classifier=(classifier, "./classifier_model_5.pth"))
+    cifarDenoiser  = DenoiserUnet(inputChannel=3, startingChannel=64).to(device)
+    trainDenoiser(device, cifarDataset, cifarDenoiser, scheduler, epochs=21)
+
+
+    # images = generateImages((denoiser,"./denoiser_model_16.pth"), scheduler,  device, nSteps=1000, nSamples=25, classifier=(classifier, "./classifier_model_5.pth"))
+    
 
 if __name__ == '__main__':
     main()

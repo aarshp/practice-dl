@@ -1,7 +1,10 @@
 # Datasets
 **/MNIST/**
 **/diffusion/MNIST/** 
+**/cifar-10-batches-py/**
 *.pkl
+*.gz
+*.zip
 
 *.pth 
 
