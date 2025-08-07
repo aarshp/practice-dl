@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import math
 import pickle
 import os
+import random
 
 class Scheduler:
     def __init__(self, T, start, end, device):
@@ -274,7 +275,7 @@ def trainClassifier(dataset, scheduler, classifier, device, optimizer = None, ep
         print(f"Model saved at epoch {epoch} with new best loss: {epochLoss:.4f}")
 
 
-def trainDenoiser(device, dataset, denoiser, scheduler, optimizer=None, epochs = 20):
+def trainDenoiser(device, dataset, denoiser, scheduler, optimizer=None, epochs = 20, percentageDropLabel = None):
     dataloader = DataLoader(dataset, shuffle=True, batch_size=64)
     lossFn = nn.MSELoss()
     if optimizer ==  None: 
@@ -287,10 +288,16 @@ def trainDenoiser(device, dataset, denoiser, scheduler, optimizer=None, epochs =
         for i, (x, y) in enumerate(dataloader):
             batchSize = x.shape[0]
             x = x.to(device)
+            y = y.to(device)
             t = torch.randint(0, scheduler.T, (batchSize,), dtype=int, device=device)
             noise = torch.randn_like(x)
             xt = scheduler.samplet(x, t, noise)
-            predictedNoise = denoiser(xt, t)
+            if percentageDropLabel is not None:
+                mask = torch.rand(y.shape, device=y.device) < percentageDropLabel/100.0
+                y [mask] = 10
+            else:
+                y = None
+            predictedNoise = denoiser(xt, t, y)                
             loss = lossFn(predictedNoise, noise)
             epochLoss += loss.item()
             optimizer.zero_grad()
@@ -307,7 +314,7 @@ def trainDenoiser(device, dataset, denoiser, scheduler, optimizer=None, epochs =
             print(f"Model saved at epoch {epoch} with new best loss: {epochLoss:.4f}")
 
 
-def generateImages(denoiser, scheduler, device, nSteps = 10000, nSamples=5, imageSize =(1,32,32), classifier = None, guidanceFactor = 7):
+def generateDDPMSampleImages(denoiser, scheduler, device, nSteps = 10000, nSamples=5, imageSize =(1,32,32), classifier = None, guidanceFactor = 7):
     denoiserModel, denoiserParamsPath = denoiser
     denoiserModel.load_state_dict(torch.load(denoiserParamsPath, device))
     denoiserModel.eval()
@@ -371,10 +378,10 @@ def main():
     cifarDataset = loadCifarDataset(device=device)
 
     cifarDenoiser  = DenoiserUnet(inputChannel=3, startingChannel=64).to(device)
-    trainDenoiser(device, cifarDataset, cifarDenoiser, scheduler, epochs=21)
+    trainDenoiser(device, cifarDataset, cifarDenoiser, scheduler, epochs=21, percentageDropLabel=20)
 
 
-    # images = generateImages((denoiser,"./denoiser_model_16.pth"), scheduler,  device, nSteps=1000, nSamples=25, classifier=(classifier, "./classifier_model_5.pth"))
+    # images = generateDDPMSampleImages((denoiser,"./denoiser_model_16.pth"), scheduler,  device, nSteps=1000, nSamples=25, classifier=(classifier, "./classifier_model_5.pth"))
     
 
 if __name__ == '__main__':
