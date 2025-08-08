@@ -275,15 +275,21 @@ def trainClassifier(dataset, scheduler, classifier, device, optimizer = None, ep
         print(f"Model saved at epoch {epoch} with new best loss: {epochLoss:.4f}")
 
 
-def trainDenoiser(device, dataset, denoiser, scheduler, optimizer=None, epochs = 20, percentageDropLabel = None):
+def trainDenoiser(device, dataset, denoiser, scheduler, optimizer=None, epochs = 20, percentageDropLabel = None, checkpointPath = None):
     dataloader = DataLoader(dataset, shuffle=True, batch_size=64)
     lossFn = nn.MSELoss()
     if optimizer ==  None: 
         optimizer = torch.optim.Adam(denoiser.parameters(), lr=1e-4)
-    
+    startingEpoch = 0
+
+    if checkpointPath != None:
+        denoiser.load_state_dict(torch.load(checkpointPath, device))
+        startingEpoch = checkpointPath.split('_')[-1].split('.')[0]
+        startingEpoch = int(startingEpoch)
+        print(f"Loaded checkpoint from epoch: {startingEpoch}")
     denoiser.train()
 
-    for epoch in range(epochs):
+    for epoch in range(startingEpoch, startingEpoch + epochs):
         epochLoss = 0.0
         for i, (x, y) in enumerate(dataloader):
             batchSize = x.shape[0]
@@ -378,7 +384,7 @@ def main():
     cifarDataset = loadCifarDataset(device=device)
 
     cifarDenoiser  = DenoiserUnet(inputChannel=3, startingChannel=64).to(device)
-    trainDenoiser(device, cifarDataset, cifarDenoiser, scheduler, epochs=21, percentageDropLabel=20)
+    trainDenoiser(device, cifarDataset, cifarDenoiser, scheduler, epochs=21, percentageDropLabel=20, checkpointPath="./denoiser_model_40.pth")
 
 
     # images = generateDDPMSampleImages((denoiser,"./denoiser_model_16.pth"), scheduler,  device, nSteps=1000, nSamples=25, classifier=(classifier, "./classifier_model_5.pth"))
