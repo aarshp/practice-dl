@@ -27,18 +27,17 @@ class Scheduler:
         return xt
     
 class ResnetBlock(nn.Module):
-    def __init__ (self, inChannel, outChannel, positionalEncodingSize):
+    def __init__ (self, inChannel, outChannel, encodingSize):
         super(ResnetBlock, self).__init__()
 
-        self.doSkip = False
-        self.doProjection = True
+        self.doProjectedSkip = False
         if inChannel != outChannel:
-            self.doSkip = True
-            self.skipConv = nn.Conv2d(inChannel, outChannel, (1,1), stride=1)
+            self.doProjectedSkip = True
+            self.projectedSkip = nn.Conv2d(inChannel, outChannel, (1,1), stride=1)
         
         self.conv1 = nn.Conv2d(inChannel, outChannel, (3,3), stride=1, padding=1, bias=False)
         self.conv2 = nn.Conv2d(outChannel, outChannel, (3,3), stride=1, padding=1, bias=False)
-        self.projection = nn.Linear(positionalEncodingSize, outChannel)
+        self.projection = nn.Linear(encodingSize, outChannel)
         self.norm1 = nn.GroupNorm(8, outChannel)
         self.norm2 = nn.GroupNorm(8, outChannel)
         self.activation = nn.SiLU()
@@ -54,8 +53,8 @@ class ResnetBlock(nn.Module):
         output = self.norm2(output)
         output = self.activation(output)
 
-        if (self.doSkip == True):
-            output = output + self.skipConv(input)
+        if (self.doProjectedSkip == True):
+            output = output + self.projectedSkip(input)
         else:
             output = output + input
 
@@ -315,7 +314,7 @@ def trainDenoiser(device, dataset, denoiser, scheduler, optimizer=None, epochs =
         epochLoss = epochLoss / len(dataloader)
         print(f"--- Epoch {epoch} Average Loss: {epochLoss:.4f} ---")
 
-        if epoch % 4 == 0:
+        if epoch % 10 == 0:
             torch.save(denoiser.state_dict(), f'denoiser_model_{epoch}.pth')
             print(f"Model saved at epoch {epoch} with new best loss: {epochLoss:.4f}")
 
@@ -384,7 +383,7 @@ def main():
     cifarDataset = loadCifarDataset(device=device)
 
     cifarDenoiser  = DenoiserUnet(inputChannel=3, startingChannel=64).to(device)
-    trainDenoiser(device, cifarDataset, cifarDenoiser, scheduler, epochs=21, percentageDropLabel=20, checkpointPath="./denoiser_model_40.pth")
+    trainDenoiser(device, cifarDataset, cifarDenoiser, scheduler, epochs=51, percentageDropLabel=20, checkpointPath="./denoiser_model_40.pth")
 
 
     # images = generateDDPMSampleImages((denoiser,"./denoiser_model_16.pth"), scheduler,  device, nSteps=1000, nSamples=25, classifier=(classifier, "./classifier_model_5.pth"))
